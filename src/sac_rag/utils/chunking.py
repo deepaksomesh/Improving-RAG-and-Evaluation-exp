@@ -1,0 +1,190 @@
+from pathlib import Path
+from typing import List, Optional, cast, Literal
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
+import logging
+
+from sac_rag.data_models import Document
+from sac_rag.utils.ai import AIModel, generate_document_summary
+
+logger = logging.getLogger(__name__)
+
+
+class ChunkingStrategy(BaseModel):
+    strategy_name: Literal["naive", "rcts", "summary_naive", "summary_rcts"]
+    chunk_size: int  # For summary strategies, this is the TOTAL target length
+    chunk_overlap_ratio: float = 0.0
+
+    # Fields for summarization - these will be None for non-summary strategies
+    summary_model: Optional[AIModel] = None
+    summary_prompt_template: Optional[str] = None
+    prompt_target_char_length: int = 150  # Default target for LLM prompt
+    summary_truncation_length: int = 170  # Default hard truncation limit
+    use_cache: bool | None = True  # Whether to use cached summaries if available, 'False' will overwrite the existing cache
+
+
+class Chunk(BaseModel):
+    """Represents a text chunk with its source and span."""
+    file_path: str
+    span: tuple[int, int]  # Span refers to the original content within the document
+    content: str  # Final content, possibly prepended with summary
+
+
+def _chunk_naive(document_content: str, chunk_size: int) -> List[tuple[int, int]]:
+    """Creates chunks of fixed character size from the given content."""
+    spans = []
+    if chunk_size <= 0:
+        # logger.warning(f"Naive chunking called with non-positive chunk_size ({chunk_size}). Returning no spans.")
+        return spans
+    for i in range(0, len(document_content), chunk_size):
+        spans.append((i, min(i + chunk_size, len(document_content))))
+    return spans
+
+
+def _chunk_recursive(document_content: str, chunk_size: int, chunk_overlap_ratio: float = 0.0) -> List[tuple[int, int]]:
+    """Creates chunks using RecursiveCharacterTextSplitter from the given content."""
+    if chunk_size <= 0:
+        # logger.warning(f"Recursive chunking called with non-positive chunk_size ({chunk_size}). Returning no spans.")
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        separators=[
+            "\n\n", "\n", "!", "?", ".", ":", ";", ",", " ", ""
+        ],
+        chunk_size=chunk_size,  # This size is for the content part
+        chunk_overlap=int(chunk_size * chunk_overlap_ratio),  # Overlap for the content part
+        length_function=len,
+        is_separator_regex=False,
+        strip_whitespace=False,  # Changed from False to True as per common Langchain practice
+    )
+    splits = splitter.split_text(document_content)
+    spans = []
+    current_search_pos = 0
+    for split_text in splits:
+        if not split_text.strip():
+            continue
+        try:
+            start_index = document_content.index(split_text, current_search_pos)
+            end_index = start_index + len(split_text)
+            spans.append((start_index, end_index))
+            current_search_pos = start_index + 1
+        except ValueError:
+            logger.warning(
+                f"Could not find exact match for RCTS split text. "  # type: ignore
+                f"Split: '{split_text[:50]}...'. This split will be skipped."
+            )
+            # Attempting to advance current_search_pos naively if a split fails can lead to
+            # missing subsequent valid splits or incorrect span calculations.
+            # It's safer to skip the problematic split and log it.
+            # A more sophisticated approach might use fuzzy matching or diff algorithms,
+            # but that adds significant complexity.
+    return spans
+
+
+async def get_chunks(  # Made async
+        document: Document,
+        strategy_name: str,
+        chunk_size: int,
+        **kwargs
+) -> List[Chunk]:
+    """
+    Splits a document into chunks based on the specified strategy.
+    Supports new strategies that prepend a document summary.
+    """
+    final_chunks: List[Chunk] = []
+    document_summary = ""
+    is_summary_strategy = strategy_name.startswith("summary_")
+
+    if not is_summary_strategy and cast(Optional[AIModel], kwargs.get("summarization_model")):
+        logger.warning("Couldn't find 'summary_' in the chunking strategy name, but contains a summarization_model!")
+
+    import diskcache as dc
+    import os
+    from pathlib import Path
+    import hashlib
+    import json
+    
+    # Initialize a fast cache specifically for RCTS splits
+    chunking_cache_dir = Path(os.environ.get("SAC_CACHE_DIR", Path.cwd() / "data" / "cache")) / "rcts_splits"
+    os.makedirs(chunking_cache_dir, exist_ok=True)
+    rcts_cache = dc.Cache(str(chunking_cache_dir), size_limit=10 * (1024 ** 3))
+
+    # Generate a unique cache key based on the strategy, document content, and summary state
+    cache_key_hasher = hashlib.md5()
+    cache_key_hasher.update(strategy_name.encode('utf-8'))
+    cache_key_hasher.update(str(chunk_size).encode('utf-8'))
+    cache_key_hasher.update(str(kwargs.get("chunk_overlap_ratio", 0.0)).encode('utf-8'))
+    cache_key_hasher.update(document.content.encode('utf-8'))
+    cache_key = f"{document.file_path}_{cache_key_hasher.hexdigest()}"
+
+    cached_chunks = rcts_cache.get(cache_key)
+    if cached_chunks is not None:
+        return [Chunk(**c) for c in cached_chunks]
+
+    if is_summary_strategy:
+        summarization_model = cast(Optional[AIModel], kwargs.get("summarization_model"))
+        summary_prompt_template = cast(Optional[str], kwargs.get("summary_prompt_template"))
+        prompt_target_char_length = cast(int, kwargs.get("prompt_target_char_length", 150))
+        summary_truncation_length = cast(int, kwargs.get("summary_truncation_length", 170))
+        use_cache = cast(bool, kwargs.get("use_cache", True))
+        summaries_base_dir = Path(os.environ.get("SAC_SUMMARIES_DIR", Path.cwd() / "data" / "summaries"))
+
+        if not summarization_model or not summary_prompt_template:
+            logger.error(
+                f"Summarization model or prompt template not provided for strategy '{strategy_name}' "
+                f"on document {document.file_path}. Summary step will be skipped (fallback in generate_document_summary)."
+            )
+        else:
+            document_summary = await generate_document_summary(
+                document_file_path=document.file_path,
+                document_content=document.content,
+                summarization_model=summarization_model,
+                summary_prompt_template=summary_prompt_template,
+                prompt_target_char_length=prompt_target_char_length,
+                truncate_char_length=summary_truncation_length,
+                use_cache=use_cache,
+                summaries_output_dir_base=summaries_base_dir
+            )
+
+    # Determine content chunking details
+    content_strategy_name = strategy_name.split("summary_")[-1] if is_summary_strategy else strategy_name
+
+    # Define the format for summary prefix
+    summary_prefix = f"[document summary] {document_summary}\n[content] " if is_summary_strategy and document_summary else ""
+
+    # Perform content chunking based on the original document content
+    content_spans: List[tuple[int, int]] = []
+    if content_strategy_name == "naive":
+        content_spans = _chunk_naive(document.content, chunk_size)
+    elif content_strategy_name == "rcts":
+        overlap_ratio = cast(float, kwargs.get("chunk_overlap_ratio", 0.0))  # Use 0.0 as default if not summary_rcts
+        content_spans = _chunk_recursive(document.content, chunk_size, chunk_overlap_ratio=overlap_ratio)
+    else:
+        raise ValueError(f"Unknown base chunking strategy derived: {content_strategy_name} from {strategy_name}")
+
+    # Construct final Chunk objects
+    for span_start, span_end in content_spans:
+        if span_end <= span_start:
+            continue  # Should be handled by _chunk_xxx if target_size <=0, but defensive check.
+
+        original_content_text = document.content[span_start:span_end]
+        final_chunk_text = summary_prefix + original_content_text
+
+        final_chunks.append(
+            Chunk(
+                file_path=document.file_path,
+                span=(span_start, span_end),
+                content=final_chunk_text
+            )
+        )
+
+    if not final_chunks and len(document.content) > 0:  # Added condition
+        len_summary_prefix = len(summary_prefix)  # This includes the "[document summary]..." and "[content]" parts
+        logger.warning(
+            f"No chunks were generated for document {document.file_path} (len: {len(document.content)}) with strategy {strategy_name}, total_chunk_size {chunk_size}, len summary prefix {len_summary_prefix}).")
+
+    # Save to diskcache before returning
+    rcts_cache.set(cache_key, [c.model_dump() for c in final_chunks])
+
+    return final_chunks

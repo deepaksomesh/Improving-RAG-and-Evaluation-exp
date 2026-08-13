@@ -1,0 +1,668 @@
+import argparse
+import asyncio
+import logging
+import math
+import os
+import random
+from typing import List, Tuple, Dict, Any
+import pandas as pd
+from pydantic import BaseModel, computed_field, model_validator
+from functools import cached_property
+from tqdm import tqdm
+from typing_extensions import Self
+from datetime import datetime
+
+from sac_rag.data_models import Benchmark, Document, QAGroundTruth, RetrievalMethod, RetrievedSnippet
+from sac_rag.utils.credentials import credentials
+from sac_rag.utils.hyde import generate_legal_hypothesis
+from sac_rag.utils.config_loader import load_strategy_from_file
+from sac_rag.utils.retriever_factory import create_retriever
+from sac_rag.methods.baseline import BaselineRetrievalStrategy, BaselineRetrievalMethod, serialize_f32, EmbeddingInfo
+from sac_rag.methods.hybrid import HybridStrategy
+from sac_rag.utils.utils import sanitize_filename
+from sac_rag.utils.stats_tracker import stats_tracker
+from sac_rag.utils.chunking import get_chunks, Chunk
+from sac_rag.utils.ai import ai_embedding, AIEmbeddingType
+import sqlite3
+import sqlite_vec
+import numpy as np
+
+class DocnameHydeRetrievalMethod(BaselineRetrievalMethod):
+    async def sync_all_documents(self) -> None:
+        stats_tracker.start_timer('chunking_and_summarization')
+        print(f"DualHyde: Calculating chunks using strategy '{self.retrieval_strategy.chunking_strategy.strategy_name}'...")
+
+        chunking_params = {
+            "strategy_name": self.retrieval_strategy.chunking_strategy.strategy_name,
+            "chunk_size": self.retrieval_strategy.chunking_strategy.chunk_size,
+            "chunk_overlap_ratio": self.retrieval_strategy.chunking_strategy.chunk_overlap_ratio,
+        }
+        if self.retrieval_strategy.chunking_strategy.strategy_name.startswith("summary_"):
+            chunking_params["summarization_model"] = self.retrieval_strategy.chunking_strategy.summary_model
+            chunking_params["summary_prompt_template"] = self.retrieval_strategy.chunking_strategy.summary_prompt_template
+            chunking_params["prompt_target_char_length"] = self.retrieval_strategy.chunking_strategy.prompt_target_char_length
+            chunking_params["summary_truncation_length"] = self.retrieval_strategy.chunking_strategy.summary_truncation_length
+            chunking_params["use_cache"] = getattr(self.retrieval_strategy.chunking_strategy, 'use_cache', True)
+
+        all_chunks_tasks = []
+        for document in self.documents.values():
+            task = asyncio.create_task(get_chunks(document=document, **chunking_params))
+            all_chunks_tasks.append(task)
+
+        results_of_chunking_tasks = await asyncio.gather(*all_chunks_tasks)
+
+        all_chunks: List[Chunk] = []
+        for chunk_list_for_doc in results_of_chunking_tasks:
+            all_chunks.extend(chunk_list_for_doc)
+
+        stats_tracker.set('chunks_created', len(all_chunks))
+        stats_tracker.stop_timer('chunking_and_summarization')
+        print(f"DualHyde: Created {len(all_chunks)} chunks.")
+
+        if not all_chunks:
+            self.embedding_infos = []
+            return
+
+        self.embedding_infos = []
+        stats_tracker.start_timer('embedding_generation')
+        progress_bar = tqdm(total=len(all_chunks), desc="DualHyde: Processing Embeddings", ncols=100)
+
+        def progress_callback():
+            if progress_bar:
+                progress_bar.update(1)
+
+        # ====== THE DOCNAME INJECTION ======
+        chunk_contents = [
+            f"Document Name: {os.path.basename(chunk.file_path)}\n\n{chunk.content}" 
+            for chunk in all_chunks
+        ]
+        # ===================================
+
+        embeddings = await ai_embedding(
+            self.retrieval_strategy.embedding_model,
+            chunk_contents,
+            AIEmbeddingType.DOCUMENT,
+            callback=progress_callback,
+        )
+
+        if progress_bar:
+            progress_bar.close()
+        stats_tracker.stop_timer('embedding_generation')
+
+        print(f"DualHyde: Start indexing embeddings into SQLite...")
+
+        if self.sqlite_db is None:
+            if os.path.exists(self.sqlite_db_file_path):
+                os.remove(self.sqlite_db_file_path)
+            self.sqlite_db = sqlite3.connect(self.sqlite_db_file_path)
+            self.sqlite_db.enable_load_extension(True)
+            sqlite_vec.load(self.sqlite_db)
+            self.sqlite_db.enable_load_extension(False)
+            self.sqlite_db.execute(f"PRAGMA mmap_size = {3 * 1024 * 1024 * 1024}")
+            if embeddings:
+                self.sqlite_db.execute(
+                    f"CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[{len(embeddings[0])}])"
+                )
+
+        if not embeddings:
+            return
+
+        with self.sqlite_db:
+            for i, emb in enumerate(embeddings):
+                self.sqlite_db.execute(
+                    "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)",
+                    (i + 1, serialize_f32(emb)),
+                )
+                chunk = all_chunks[i]
+                self.embedding_infos.append(
+                    EmbeddingInfo(
+                        document_id=chunk.file_path,
+                        span=chunk.span,
+                        processed_content=chunk_contents[i],
+                    )
+                )
+
+        print(f"DualHyde: Finished indexing {len(self.embedding_infos)} embeddings.")
+
+    async def query(self, query: str) -> 'sac_rag.data_models.QueryResponse':
+        from sac_rag.data_models import QueryResponse, RetrievedSnippet
+        from typing import cast
+        
+        if self.sqlite_db is None or not self.embedding_infos:
+            raise ValueError("Sync documents before querying!")
+
+        embeddings = await ai_embedding(
+            self.retrieval_strategy.embedding_model, [query], AIEmbeddingType.QUERY
+        )
+        q_emb = np.array(embeddings[0], dtype=np.float32)
+
+        # Normalize
+        q_emb = q_emb / np.linalg.norm(q_emb)
+        
+        query_embedding_bytes = serialize_f32(q_emb.tolist())
+
+        fetch_k = self.retrieval_strategy.embedding_top_k
+        
+        rows = self.sqlite_db.execute(
+            """
+            SELECT rowid, distance
+            FROM vec_items
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+            """,
+            [query_embedding_bytes, fetch_k],
+        ).fetchall()
+
+        retrieved_snippets = []
+        for row_id_sqlite, distance in rows:
+            meta_index = cast(int, row_id_sqlite) - 1
+            if 0 <= meta_index < len(self.embedding_infos):
+                info = self.embedding_infos[meta_index]
+                retrieved_snippets.append(
+                    RetrievedSnippet(
+                        file_path=info.document_id,
+                        span=info.span,
+                        full_chunk_text=info.processed_content,
+                        score=float(1.0 - distance),
+                    )
+                )
+
+        return QueryResponse(retrieved_snippets=retrieved_snippets)
+
+import sac_rag.utils.retriever_factory
+sac_rag.utils.retriever_factory.BaselineRetrievalMethod = DocnameHydeRetrievalMethod
+
+# --- Pydantic Models for this Benchmark's Evaluation Logic ---
+class QAResult(BaseModel):
+    qa_gt: QAGroundTruth
+    retrieved_snippets: list[RetrievedSnippet]
+
+    @cached_property
+    def _relevant_retrieved_length(self) -> int:
+        overlap_len = 0
+        for snippet in self.retrieved_snippets:
+            for gt_snippet in self.qa_gt.snippets:
+                if snippet.file_path == gt_snippet.file_path:
+                    overlap_start = max(snippet.span[0], gt_snippet.span[0])
+                    overlap_end = min(snippet.span[1], gt_snippet.span[1])
+                    if overlap_end > overlap_start:
+                        overlap_len += overlap_end - overlap_start
+        return overlap_len
+
+    @cached_property
+    def _total_retrieved_length(self) -> int:
+        return sum(s.span[1] - s.span[0] for s in self.retrieved_snippets)
+
+    @cached_property
+    def _total_relevant_length(self) -> int:
+        return sum(gt.span[1] - gt.span[0] for gt in self.qa_gt.snippets)
+
+    @computed_field
+    @property
+    def precision(self) -> float:
+        if self._total_retrieved_length == 0:
+            return 0.0
+        return self._relevant_retrieved_length / self._total_retrieved_length
+
+    @computed_field
+    @property
+    def recall(self) -> float:
+        if self._total_relevant_length == 0:
+            return 0.0
+        return self._relevant_retrieved_length / self._total_relevant_length
+
+    @computed_field
+    @property
+    def crux_coverage(self) -> float:
+        if not self.qa_gt.snippets:
+            return 0.0
+        hit_count = 0
+        for gt_snippet in self.qa_gt.snippets:
+            for snippet in self.retrieved_snippets:
+                if snippet.file_path == gt_snippet.file_path:
+                    overlap_start = max(snippet.span[0], gt_snippet.span[0])
+                    overlap_end = min(snippet.span[1], gt_snippet.span[1])
+                    if overlap_end > overlap_start:
+                        hit_count += 1
+                        break
+        return hit_count / len(self.qa_gt.snippets)
+
+    @computed_field
+    @property
+    def crux_density(self) -> float:
+        if not self.retrieved_snippets:
+            return 0.0
+        useful_chunks = 0
+        for snippet in self.retrieved_snippets:
+            is_useful = False
+            for gt_snippet in self.qa_gt.snippets:
+                if snippet.file_path == gt_snippet.file_path:
+                    overlap_start = max(snippet.span[0], gt_snippet.span[0])
+                    overlap_end = min(snippet.span[1], gt_snippet.span[1])
+                    if overlap_end > overlap_start:
+                        is_useful = True
+                        break
+            if is_useful:
+                useful_chunks += 1
+        return useful_chunks / len(self.retrieved_snippets)
+
+def avg(arr: list[float]) -> float:
+    return sum(arr) / len(arr) if arr else float("nan")
+
+class BenchmarkResult(BaseModel):
+    qa_result_list: list[QAResult]
+    weights: list[float]
+
+    def get_avg_recall_and_precision(self, tag_filter: str | None = None) -> tuple[float, float]:
+        indices = [
+            i for i, qa_result in enumerate(self.qa_result_list)
+            if tag_filter is None or tag_filter in qa_result.qa_gt.tags
+        ]
+        if not indices:
+            return float("nan"), float("nan")
+
+        filtered_results = [self.qa_result_list[i] for i in indices]
+        filtered_weights = [self.weights[i] for i in indices]
+
+        total_weight = sum(filtered_weights)
+        if total_weight == 0:
+            avg_recall = avg([r.recall for r in filtered_results])
+            avg_precision = avg([r.precision for r in filtered_results])
+            return avg_recall, avg_precision
+
+        recall_weighted_avg = sum(r.recall * w for r, w in zip(filtered_results, filtered_weights)) / total_weight
+        precision_weighted_avg = sum(r.precision * w for r, w in zip(filtered_results, filtered_weights)) / total_weight
+        return recall_weighted_avg, precision_weighted_avg
+
+    def get_avg_crux_metrics(self, tag_filter: str | None = None) -> tuple[float, float]:
+        indices = [
+            i for i, qa_result in enumerate(self.qa_result_list)
+            if tag_filter is None or tag_filter in qa_result.qa_gt.tags
+        ]
+        if not indices:
+            return float("nan"), float("nan")
+
+        filtered_results = [self.qa_result_list[i] for i in indices]
+        filtered_weights = [self.weights[i] for i in indices]
+
+        total_weight = sum(filtered_weights)
+        if total_weight == 0:
+            avg_cov = avg([r.crux_coverage for r in filtered_results])
+            avg_den = avg([r.crux_density for r in filtered_results])
+            return avg_cov, avg_den
+
+        cov_weighted_avg = sum(r.crux_coverage * w for r, w in zip(filtered_results, filtered_weights)) / total_weight
+        den_weighted_avg = sum(r.crux_density * w for r, w in zip(filtered_results, filtered_weights)) / total_weight
+        return cov_weighted_avg, den_weighted_avg
+
+    @computed_field
+    @property
+    def avg_precision(self) -> float:
+        return self.get_avg_recall_and_precision()[1]
+
+    @computed_field
+    @property
+    def avg_recall(self) -> float:
+        return self.get_avg_recall_and_precision()[0]
+
+    @computed_field
+    @property
+    def avg_crux_coverage(self) -> float:
+        return self.get_avg_crux_metrics()[0]
+
+    @computed_field
+    @property
+    def avg_crux_density(self) -> float:
+        return self.get_avg_crux_metrics()[1]
+
+    @computed_field
+    @property
+    def avg_f1_score(self) -> float:
+        precision, recall = self.avg_precision, self.avg_recall
+        if not (math.isnan(precision) or math.isnan(recall)) and (precision + recall > 0):
+            return 2 * (precision * recall) / (precision + recall)
+        return float('nan')
+
+    @model_validator(mode="after")
+    def validate_lengths(self) -> Self:
+        if len(self.qa_result_list) != len(self.weights):
+            raise ValueError("Length of qa_result_list and weights do not match!")
+        return self
+
+async def run_strategy(
+        qa_gt_list: list[QAGroundTruth],
+        corpus: list[Document],
+        retriever: RetrievalMethod,
+        strat: Any,
+        weights: list[float] | None = None,
+) -> Dict[int, BenchmarkResult]:
+    for document in tqdm(corpus, desc="Ingesting documents"):
+        await retriever.ingest_document(document)
+    await retriever.sync_all_documents()
+
+    final_k_values = strat.rerank_top_k
+    if not final_k_values:
+        raise ValueError("No 'rerank_top_k' list found in the strategy config.")
+
+    full_query_results: List[Tuple[QAGroundTruth, List[RetrievedSnippet]]] = []
+    
+    print(f"Executing {len(qa_gt_list)} queries...")
+    stats_tracker.start_timer('query_processing')
+
+    query_semaphore = asyncio.Semaphore(70)
+
+    async def run_query(qa_gt: QAGroundTruth) -> Tuple[QAGroundTruth, List[RetrievedSnippet]]:
+        async with query_semaphore:
+            dataset_name = "privacy_qa"
+            valid_datasets = ["privacy_qa", "maud", "cuad", "contractnli"]
+            for tag in qa_gt.tags:
+                if tag in valid_datasets:
+                    dataset_name = tag
+                    break
+            
+            try:
+                # Legal-HyDE Generation using the original prompt
+                hypothesis = await generate_legal_hypothesis(qa_gt.query, dataset_name)
+                
+                # Search the vector DB using the combined original query and hypothetical clause.
+                combined_query = f"{qa_gt.query}\n\n{hypothesis}"
+                query_response = await retriever.query(combined_query)
+                return qa_gt, query_response.retrieved_snippets
+            except Exception as e:
+                print(f"Error executing query '{qa_gt.query[:50]}...': {e}")
+                return qa_gt, []
+
+    tasks = [run_query(qa_gt) for qa_gt in qa_gt_list]
+    for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Running queries"):
+        result = await future
+        full_query_results.append(result)
+
+    await retriever.cleanup()
+    stats_tracker.stop_timer('query_processing')
+
+    results_by_k: Dict[int, BenchmarkResult] = {}
+    for k in final_k_values:
+        qa_results_for_k: list[QAResult] = []
+        for qa_gt, full_retrieved_snippets in full_query_results:
+            sliced_snippets = full_retrieved_snippets[:k]
+            qa_results_for_k.append(
+                QAResult(qa_gt=qa_gt, retrieved_snippets=sliced_snippets)
+            )
+
+        results_by_k[k] = BenchmarkResult(
+            qa_result_list=qa_results_for_k,
+            weights=weights if weights is not None else [1.0] * len(qa_results_for_k),
+        )
+
+    return results_by_k
+
+def setup_and_load_data(max_tests: int, sort_by_doc: bool, seed: int, use_mini_dataset: bool) -> Tuple[List[Document], List[QAGroundTruth], List[float]]:
+    all_tests, weights, used_doc_paths = [], [], set()
+
+    for dataset_name, weight in benchmark_name_to_weight.items():
+        base_dir = "./legalbenchragmini" if use_mini_dataset else "./data"
+        bench_dir = "benchmark" if use_mini_dataset else "benchmarks"
+        benchmark_file = f"{base_dir}/{bench_dir}/{dataset_name}.json"
+        if not os.path.exists(benchmark_file):
+            print(f"Warning: Benchmark file not found: {benchmark_file}. Skipping.")
+            continue
+
+        with open(benchmark_file, encoding='utf-8') as f:
+            tests = Benchmark.model_validate_json(f.read()).tests
+
+        for test in tests:
+            ignore_prefix = f"{dataset_name}/"
+            for snippet in test.snippets:
+                snippet.orig_file_path = snippet.file_path
+                snippet.file_path = sanitize_filename(snippet.file_path, ignore_dirs=ignore_prefix)
+
+        sampled_tests = tests
+        if 0 < max_tests < len(tests):
+            print(f"Sampling {max_tests} tests from {dataset_name} ({len(tests)} total)")
+            if sort_by_doc:
+                tests = sorted(tests, key=lambda t: t.snippets[0].file_path if t.snippets else "")
+            else:
+                if seed is not None:
+                    random.seed(seed)
+                else:
+                    random.seed(dataset_name + str(max_tests))
+                random.shuffle(tests)
+            sampled_tests = tests[:max_tests]
+
+        for t in sampled_tests:
+            for s in t.snippets:
+                used_doc_paths.add(s.file_path)
+
+        for t in sampled_tests:
+            t.tags = [dataset_name]
+
+        all_tests.extend(sampled_tests)
+        if sampled_tests:
+            per_test_weight = weight / len(sampled_tests)
+            weights.extend([per_test_weight] * len(sampled_tests))
+
+    print(f"Total tests selected across all benchmarks: {len(all_tests)}")
+
+    corpus, loaded_paths = [], set()
+    print(f"Attempting to load {len(used_doc_paths)} required corpus documents...")
+    for doc_path in sorted(list(used_doc_paths)):
+        full_path = f"{base_dir}/corpus/{doc_path}"
+        if not os.path.exists(full_path):
+            print(f"Warning: Corpus file not found at '{full_path}'. Skipping.")
+            continue
+
+        with open(full_path, encoding='utf-8') as f:
+            content = f.read()
+            if content.strip():
+                corpus.append(Document(file_path=doc_path, content=content))
+                loaded_paths.add(doc_path)
+
+    print(f"Successfully loaded {len(loaded_paths)} corpus documents.")
+
+    # Filter tests to only those with loaded documents
+    final_tests, final_weights = [], []
+    for i, test in enumerate(all_tests):
+        all_loaded = True
+        for s in test.snippets:
+            if s.file_path not in loaded_paths:
+                all_loaded = False
+                break
+        if all_loaded:
+            final_tests.append(test)
+            final_weights.append(weights[i])
+
+    if len(final_tests) != len(all_tests):  # should never happen
+        print(f"Filtered out {len(all_tests) - len(final_tests)} tests due to missing corpus files.")
+
+    if not final_tests:
+        raise RuntimeError("No valid tests remaining after document filtering. Exiting.")
+
+    return corpus, final_tests, final_weights
+
+
+benchmark_name_to_weight: dict[str, float] = {
+    "privacy_qa": 0.25, "contractnli": 0.25, "maud": 0.25, "cuad": 0.25
+}
+
+benchmark_name_to_weight_test: dict[str, float] = {
+    "lbrag_test": 1.0
+}
+
+
+def create_summary_row(idx: int, config_path: str, strategy: Any, result: BenchmarkResult, top_k: int) -> Dict[str, Any]:
+    """Creates a detailed dictionary row for the summary CSV."""
+
+    # Start with basic info
+    row = {
+        "i": idx,
+        "config_file": config_path,
+        "recall": result.avg_recall,
+        "precision": result.avg_precision,
+        "f1_score": result.avg_f1_score,
+        "crux_coverage": result.avg_crux_coverage,
+        "crux_density": result.avg_crux_density,
+        "chunk_strategy_name": strategy.chunking_strategy.strategy_name,
+        "chunk_size": strategy.chunking_strategy.chunk_size,
+        "embedding_model_company": strategy.embedding_model.company,
+        "embedding_model_name": strategy.embedding_model.model,
+        "embedding_top_k": strategy.embedding_top_k,
+        "rerank_model_company": strategy.rerank_model.company if strategy.rerank_model else None,
+        "rerank_model_name": strategy.rerank_model.model if strategy.rerank_model else None,
+        "rerank_top_k": top_k,
+    }
+
+    # Deconstruct the strategy object to get detailed columns
+    if isinstance(strategy, BaselineRetrievalStrategy):
+        row.update({
+            "method": "baseline",
+        })
+    elif isinstance(strategy, HybridStrategy):
+        row.update({
+            "method": "hybrid",
+            "bm25_top_k": strategy.bm25_top_k,
+            "fusion_top_k": strategy.fusion_top_k,
+            "fusion_weight": strategy.fusion_weight,
+        })
+    else:
+        print("WARNING: Unsupported strategy type. Skipping.")
+
+    # Add the per-benchmark metrics
+    for benchmark_name in benchmark_name_to_weight:
+        avg_recall, avg_precision = result.get_avg_recall_and_precision(benchmark_name)
+        avg_crux_cov, avg_crux_den = result.get_avg_crux_metrics(benchmark_name)
+        row[f"{benchmark_name}|recall"] = avg_recall
+        row[f"{benchmark_name}|precision"] = avg_precision
+        row[f"{benchmark_name}|crux_coverage"] = avg_crux_cov
+        row[f"{benchmark_name}|crux_density"] = avg_crux_den
+
+        f1 = float('nan')
+        if not (math.isnan(avg_precision) or math.isnan(avg_recall)) and (avg_precision + avg_recall > 0):
+            f1 = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall)
+        row[f"{benchmark_name}|f1_score"] = f1
+
+    return row
+
+
+# --- Main Orchestrator ---
+
+async def main(args):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')  # TODO: revert to logging.WARNING
+    logging.getLogger("bm25s").setLevel(logging.WARNING)
+
+    stats_tracker.start_timer('overall_run')
+    start_time = datetime.now()
+    print(f"Starting Legalbench-RAG benchmark run at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    os.environ["OPENAI_API_KEY"] = credentials.ai.openai_api_key.get_secret_value()
+    os.environ["COHERE_API_KEY"] = credentials.ai.cohere_api_key.get_secret_value()
+    os.environ["VOYAGEAI_API_KEY"] = credentials.ai.voyageai_api_key.get_secret_value()
+
+    # 1. Setup and load all data once
+    stats_tracker.start_timer('data_setup')
+    corpus, tests, weights = setup_and_load_data(args.max_tests_per_benchmark, args.sort_by_document, args.seed, args.use_mini_dataset)
+    stats_tracker.stop_timer('data_setup')
+    stats_tracker.set('documents_processed', len(corpus))
+    stats_tracker.set('queries_processed', len(tests))
+
+    # 2. Prepare for results
+    run_name = start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    results_dir = os.path.join(args.results_dir, run_name)
+    os.makedirs(results_dir, exist_ok=True)
+    print(f"Benchmark results will be saved to: {results_dir}")
+
+    summary_rows = []
+
+    # 3. Loop through each provided configuration file
+    for i, config_path in enumerate(args.retrieval_configs):
+        print(f"\n--- Running Config {i + 1}/{len(args.retrieval_configs)}: {config_path} ---")
+
+        try:
+            strategy = load_strategy_from_file(config_path)
+            retriever = create_retriever(strategy)
+
+            # Execute the benchmark
+            results_by_k = await run_strategy(tests, corpus, retriever, strat=strategy, weights=weights)
+
+            # Loop through the results for each k and save/summarize
+            for k, result in results_by_k.items():
+                print(f"--- Post-Processing results for k={k} ---")
+
+                # Save detailed JSON result for this run and top-k
+                config_basename, _ = os.path.splitext(os.path.basename(config_path))
+                result_filename = os.path.join(results_dir, f"{i}_{config_basename}_k{k}.json")
+                with open(result_filename, "w", encoding='utf-8') as f:
+                    f.write(result.model_dump_json(indent=2))
+
+                # Prepare the DETAILED summary row
+                row = create_summary_row(i, config_path, strategy, result, k)
+                summary_rows.append(row)
+
+                print(f"  Overall Avg Recall:        {100 * result.avg_recall: .2f}%")
+                print(f"  Overall Avg Precision:     {100 * result.avg_precision: .2f}%")
+                print(f"  Overall Avg F1-Score:      {100 * result.avg_f1_score: .2f}%")
+                print(f"  Overall Avg CRUX Coverage: {100 * result.avg_crux_coverage: .2f}%")
+                print(f"  Overall Avg CRUX Density:  {100 * result.avg_crux_density: .2f}%")
+
+        except Exception as e:
+            import traceback
+            print(f"!!!!!!!!!!!! ERROR running benchmark for config {config_path} !!!!!!!!!!!!")
+            print(f"Error: {e}")
+            traceback.print_exc()
+            summary_rows.append(
+                {"config_file": config_path, "recall": "ERROR", "precision": "ERROR", "f1_score": "ERROR"})
+
+    # 4. Save final summary CSV and STATS
+    if summary_rows:
+        df = pd.DataFrame(summary_rows)
+        summary_path = os.path.join(results_dir, "results_summary.csv")
+        df.to_csv(summary_path, index=False)
+        print(f'\nOverall Benchmark summary saved to: "{summary_path}"')
+
+    stats_tracker.stop_timer('overall_run')
+    stats_report_content = stats_tracker.report()
+    stats_path = os.path.join(results_dir, "stats.txt")
+    try:
+        with open(stats_path, "w", encoding='utf-8') as f:
+            f.write(stats_report_content)
+            print(f'\nOperational stats saved to: "{stats_path}"')
+    except Exception as e:
+        print(f"Error saving stats report: {e}. Skipping...")
+    print("\n" + stats_report_content)  # Also print to console for convenience
+
+    print(f"\nBenchmark run '{run_name}' finished.")
+
+    end_time = datetime.now()
+    print(f"Run finished at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total duration: {end_time - start_time}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the legalbench-rag benchmark.")
+    parser.add_argument(
+        "--retrieval-configs", "-rc",
+        nargs='+', required=True,
+        help="One or more paths to retrieval strategy JSON config files."
+    )
+    parser.add_argument(
+        "--max-tests-per-benchmark", "-m", type=int, default=194,
+        help="Maximum number of tests to sample from each sub-benchmark (e.g., cuad, maud). Set a low number for debug."
+    )
+    parser.add_argument(
+        "--sort-by-document", action="store_true",
+        help="Enable sorting by document to potentially speed up ingestion during testing."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None
+    )
+    parser.add_argument(
+        "--results-dir", type=str, default="./results/legalbenchrag_dual_hyde",
+        help="Base directory to save the output run folder."
+    )
+    parser.add_argument(
+        "--use-mini-dataset", action="store_true",
+        help="Use the miniature dataset for quick debugging."
+    )
+
+    args = parser.parse_args()
+    asyncio.run(main(args))

@@ -1,0 +1,32 @@
+.DS_Store
+.venv
+.swp
+__pycache__
+*.log
+*.png
+*.jpg
+*.pdf
+*.json
+*.jsonl
+*.csv
+*.txt
+*.db
+
+credentials/*
+!credentials/credentials.example.toml
+
+tmp
+data/cache
+data/raw_data
+benchmark_results
+plots
+results/legalbench/output
+benchmarks/legalbench/results
+benchmarks/alrag/data
+
+# TODO: Think about .egg-info at a later time
+LegalBenchRAG.egg-info
+
+# # TODO: Use git-lfs
+data/benchmarks
+data/corpus

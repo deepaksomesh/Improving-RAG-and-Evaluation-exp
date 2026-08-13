@@ -1,0 +1,31 @@
+from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    import tomli as tomllib  # For Python < 3.11
+
+from pydantic import BaseModel, SecretStr
+
+
+class AICredentials(BaseModel):
+    openai_api_key: SecretStr
+    openai_base_url: str | None = None
+    openai_openrouter_api_key: SecretStr | None = None
+    openrouter_base_url: str | None = None
+    anthropic_api_key: SecretStr
+    cohere_api_key: SecretStr
+    voyageai_api_key: SecretStr
+
+
+class DropboxCredentials(BaseModel):
+    token: SecretStr
+
+
+class Credentials(BaseModel):
+    ai: AICredentials
+    dropbox: DropboxCredentials
+
+
+with open(f"{Path.cwd()}/credentials/credentials.toml", "rb") as credentials_file:
+    credentials = Credentials.model_validate(tomllib.load(credentials_file))
