@@ -1,0 +1,1 @@
+FIIOC supplies fund data to NY Life for annuity inquiries; NY Life uses it under participation agreements, pays quarterly fee based on assets, governed by MA law, with termination clauses.
