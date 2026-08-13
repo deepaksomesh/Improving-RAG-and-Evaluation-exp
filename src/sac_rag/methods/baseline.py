@@ -241,7 +241,7 @@ class BaselineRetrievalMethod(RetrievalMethod):
         # Run the synchronous CPU-bound sqlite query in a thread so it doesn't block the asyncio event loop!
         def _run_sqlite_query():
             return self.sqlite_db.execute(
-                f"""
+                """
                 SELECT
                     rowid,
                     distance
@@ -249,7 +249,7 @@ class BaselineRetrievalMethod(RetrievalMethod):
                 WHERE embedding MATCH ? AND k = ?
                 ORDER BY distance ASC
                 """,
-                [serialize_f32(query_embedding)],
+                [serialize_f32(query_embedding), self.retrieval_strategy.embedding_top_k],
             ).fetchall()
             
         import asyncio
