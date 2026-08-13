@@ -246,7 +246,7 @@ class BaselineRetrievalMethod(RetrievalMethod):
                     rowid,
                     distance
                 FROM vec_items
-                WHERE embedding MATCH ? AND k = {self.retrieval_strategy.embedding_top_k}
+                WHERE embedding MATCH ? AND k = ?
                 ORDER BY distance ASC
                 LIMIT ?
                 """,
