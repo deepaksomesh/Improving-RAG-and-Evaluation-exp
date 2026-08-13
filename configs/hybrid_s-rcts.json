@@ -1,0 +1,27 @@
+{
+  "strategy_type": "hybrid",
+  "chunking_strategy": {
+    "strategy_name": "summary_rcts",
+    "chunk_size": 500,
+    "chunk_overlap_ratio": 0.0,
+    "summary_model": {
+      "company": "openai",
+      "model": "gpt-4o-mini"
+    },
+    "summary_prompt_template": "System: You are an expert legal metadata extractor. User: Extract the key metadata from the following legal document and format it strictly as a single line string like: 'Type: [Document Type] | Parties: [Party A, Party B] | Subject: [Brief subject matter]'. Do not include any filler words, introductory phrases, or formatting artifacts (like underlines or 'insert name'). It must be less than {target_char_length} characters. Document:\n{document_content}",
+    "prompt_target_char_length": 150,
+    "summary_truncation_length": 170,
+    "use_cache": true
+  },
+  "embedding_model": {
+    "company": "openai",
+    "model": "text-embedding-3-large"
+  },
+  "embedding_top_k": 128,
+  "bm25_top_k": 128,
+  "fusion_top_k": 64,
+  "fusion_weight": 1.0,
+  "rerank_model": null,
+  "rerank_top_k": [1, 2, 4, 8, 16, 32, 64],
+  "token_limit": null
+}
