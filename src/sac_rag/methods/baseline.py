@@ -248,7 +248,6 @@ class BaselineRetrievalMethod(RetrievalMethod):
                 FROM vec_items
                 WHERE embedding MATCH ? AND k = ?
                 ORDER BY distance ASC
-                LIMIT ?
                 """,
                 [serialize_f32(query_embedding)],
             ).fetchall()
