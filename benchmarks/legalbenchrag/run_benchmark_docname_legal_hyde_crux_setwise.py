@@ -363,15 +363,13 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
     if ai_conn.openrouter_client is None:
         raise ValueError("OpenRouter client is not initialized.")
 
-    prompt = f"Given a query \"{query}\", which of the following passages is more relevant one to the query?\n"
+    prompt = f"Given a query \"{query}\", which of the following passages is the most relevant to the query?\n\n"
     
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     for i, candidate in enumerate(candidates):
-        letter = letters[i]
         passage_text = candidate.full_chunk_text
-        prompt += f"Passage {letter}: {passage_text}\n"
+        prompt += f"[{i+1}] {passage_text}\n\n"
     
-    prompt += "Output only the passage label of the most relevant passage:"
+    prompt += "Output only the passage number of the most relevant passage. Do not output anything else."
 
     for attempt in range(3):
         try:
@@ -381,19 +379,19 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
                 max_tokens=10,
                 temperature=0.0
             )
-            output = response.choices[0].message.content.strip().upper()
+            output = response.choices[0].message.content.strip()
             
-            # Parse output, which could be "PASSAGE B" or just "B"
+            # Look for exact bracket match e.g. [2]
             for i in range(len(candidates)):
-                letter = letters[i]
-                if f"PASSAGE {letter}" in output or output == letter:
+                if f"[{i+1}]" in output:
                     return i
-            
-            # Fallback parsing
-            for char in output:
-                if char in letters[:len(candidates)]:
-                    return letters.index(char)
                     
+            # Fallback parsing: find the first number in the output
+            import re
+            match = re.search(r'\b([1-' + str(len(candidates)) + r'])\b', output)
+            if match:
+                return int(match.group(1)) - 1
+                
             return 0
 
         except Exception as e:
