@@ -69,6 +69,9 @@ class BaselineRetrievalMethod(RetrievalMethod):
         self.documents = {}
         self.embedding_infos = None
         self.sqlite_db = None
+        self.sqlite_lock = threading.Lock()
+        
+        
         self.cache_dir = Path.cwd() / "data" / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # The filename is now constructed from the configured, absolute path
@@ -80,7 +83,8 @@ class BaselineRetrievalMethod(RetrievalMethod):
     # async def cleanup(self) -> None:
     #     if self.sqlite_db is not None:
     #         self.sqlite_db.close()
-    #         self.sqlite_db = None
+    #         
+        
     #     if self.sqlite_db_file_path is not None and os.path.exists(self.sqlite_db_file_path):
     #         try:
     #             os.remove(self.sqlite_db_file_path)
@@ -332,5 +336,6 @@ class BaselineRetrievalMethod(RetrievalMethod):
         """Closes the SQLite database connection to release file locks."""
         if self.sqlite_db is not None:
             self.sqlite_db.close()
-            self.sqlite_db = None
+            
+        
             logger.info("Baseline: SQLite database connection closed.")
