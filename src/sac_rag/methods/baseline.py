@@ -77,16 +77,16 @@ class BaselineRetrievalMethod(RetrievalMethod):
         else:
             self.sqlite_db_file_path = self.cache_dir / f"baseline_{os.getpid()}_vec.db"
 
-    async def cleanup(self) -> None:
-        if self.sqlite_db is not None:
-            self.sqlite_db.close()
-            self.sqlite_db = None
-        if self.sqlite_db_file_path is not None and os.path.exists(self.sqlite_db_file_path):
-            try:
-                os.remove(self.sqlite_db_file_path)
-            except OSError as e:
-                print(f"Warning: Could not remove baseline DB file: {e}")
-            self.sqlite_db_file_path = None
+    # async def cleanup(self) -> None:
+    #     if self.sqlite_db is not None:
+    #         self.sqlite_db.close()
+    #         self.sqlite_db = None
+    #     if self.sqlite_db_file_path is not None and os.path.exists(self.sqlite_db_file_path):
+    #         try:
+    #             os.remove(self.sqlite_db_file_path)
+    #         except OSError as e:
+    #             print(f"Warning: Could not remove baseline DB file: {e}")
+    #         self.sqlite_db_file_path = None
 
     async def ingest_document(self, document: Document) -> None:
         # Store the full document content for later text retrieval
@@ -240,19 +240,20 @@ class BaselineRetrievalMethod(RetrievalMethod):
 
         # Run the synchronous CPU-bound sqlite query in a thread so it doesn't block the asyncio event loop!
         def _run_sqlite_query():
-            return self.sqlite_db.execute(
-                f"""
-                SELECT
-                    rowid,
-                    distance
-                FROM vec_items
-                WHERE embedding MATCH ? AND k = {self.retrieval_strategy.embedding_top_k}
-                ORDER BY distance ASC
-                """,
-                [serialize_f32(query_embedding)],
-            ).fetchall()
+            with self.sqlite_lock:
+                return self.sqlite_db.execute(
+                    f"""
+                    SELECT
+                        rowid,
+                        distance
+                    FROM vec_items
+                    WHERE embedding MATCH ? AND k = {self.retrieval_strategy.embedding_top_k}
+                    ORDER BY distance ASC
+                    """,
+                    [serialize_f32(query_embedding)],
+                ).fetchall()
             
-        import asyncio
+        # import asyncio
         rows = await asyncio.to_thread(_run_sqlite_query)
 
         # Get metadata using the rowid
