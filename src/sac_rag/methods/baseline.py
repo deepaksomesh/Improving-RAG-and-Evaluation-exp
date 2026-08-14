@@ -4,6 +4,7 @@ import struct
 from typing import cast, List, Dict
 import asyncio
 import logging
+import threading
 from pathlib import Path
 
 import sqlite_vec
