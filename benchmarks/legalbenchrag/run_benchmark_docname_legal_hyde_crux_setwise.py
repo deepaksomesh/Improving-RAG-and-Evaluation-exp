@@ -374,7 +374,7 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
     for attempt in range(3):
         try:
             response = await ai_conn.openrouter_client.chat.completions.create(
-                model="meta-llama/llama-3.1-8b-instruct",
+                model="openai/gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=10,
                 temperature=0.0
