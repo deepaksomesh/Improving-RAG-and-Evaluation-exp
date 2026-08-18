@@ -350,6 +350,18 @@ def evaluate_crux_deterministic(qa_gt, retrieved_snippets, k_values):
     return crux_metrics_by_k
 
 
+import re
+
+from openai import AsyncOpenAI
+
+# Point this to your vLLM or Ollama server running on ALICE
+# vLLM default: "http://localhost:8000/v1"
+# Ollama default: "http://localhost:11434/v1"
+local_llm_client = AsyncOpenAI(
+    base_url="http://localhost:8000/v1", 
+    api_key="local-key"
+)
+
 async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int:
     """
     Returns the index of the most relevant candidate in the candidates list using Setwise prompting.
@@ -358,10 +370,6 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
         return -1
     if len(candidates) == 1:
         return 0
-
-    ai_conn = await get_ai_connection()
-    if ai_conn.openrouter_client is None:
-        raise ValueError("OpenRouter client is not initialized.")
 
     prompt = f"Given a query \"{query}\", which of the following passages is the most relevant to the query?\n\n"
     
@@ -373,8 +381,8 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
 
     for attempt in range(3):
         try:
-            response = await ai_conn.openrouter_client.chat.completions.create(
-                model="openai/gpt-4o-mini",
+            response = await local_llm_client.chat.completions.create(
+                model="Qwen/Qwen2.5-14B-Instruct", # Make sure this matches the exact model name hosted on vLLM/Ollama
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=10,
                 temperature=0.0
@@ -387,7 +395,6 @@ async def setwise_compare(query: str, candidates: List[RetrievedSnippet]) -> int
                     return i
                     
             # Fallback parsing: find the first number in the output
-            import re
             match = re.search(r'\b([1-' + str(len(candidates)) + r'])\b', output)
             if match:
                 return int(match.group(1)) - 1
